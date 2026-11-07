@@ -1204,9 +1204,12 @@ def main():
     reuse_temp_configs = bool(batch.get("reuse_temp_configs", False))
     if reuse_temp_configs and configured_temp_config_root is None:
         raise ValueError("reuse_temp_configs=true requires an explicit batch.temp_config_root")
+    persistent_retarget_workers = bool(batch_retarget.get("persistent_retarget_workers", False))
     reused_temp_config_count = 0
-    tasks = []
-    for entry in clip_entries:
+
+    def build_retarget_task(entry):
+        """按需构建单条任务，常驻模式下避免启动前物化数十万个大字典。"""
+        nonlocal reused_temp_config_count
         idx = int(entry["index"])
         motion_file = Path(entry["motion_file"])
         stem = str(entry["stem"])
@@ -1273,32 +1276,38 @@ def main():
             if decoupled_source_preprocess
             else (retarget_gpus[(idx - 1) % len(retarget_gpus)] if retarget_gpus else None)
         )
-        tasks.append(
-            {
-                "index": idx,
-                "total": len(motions),
-                "motion_file": motion_file,
-                "out_path": out_path,
-                "temp_config_path": temp_config_path,
-                "cmd": cmd,
-                "preprocess_argv": preprocess_argv,
-                "source_feature_cache": source_feature_cache,
-                "dry_run": args.dry_run,
-                "retarget_cpu_threads": retarget_cpu_threads,
-                "retarget_cuda_device": retarget_cuda_device,
-                "compact_log": compact_log,
-                "tail_lines_on_error": tail_lines,
-            }
-        )
+        return {
+            "index": idx,
+            "total": len(motions),
+            "motion_file": motion_file,
+            "out_path": out_path,
+            "temp_config_path": temp_config_path,
+            "cmd": cmd,
+            "preprocess_argv": preprocess_argv,
+            "source_feature_cache": source_feature_cache,
+            "dry_run": args.dry_run,
+            "retarget_cpu_threads": retarget_cpu_threads,
+            "retarget_cuda_device": retarget_cuda_device,
+            "compact_log": compact_log,
+            "tail_lines_on_error": tail_lines,
+        }
 
-    if reuse_temp_configs:
+    task_count = len(clip_entries)
+    if persistent_retarget_workers:
+        tasks = None
+        lazy_task_iter = (build_retarget_task(entry) for entry in clip_entries)
+    else:
+        tasks = [build_retarget_task(entry) for entry in clip_entries]
+        lazy_task_iter = None
+
+    if reuse_temp_configs and not persistent_retarget_workers:
         print(
-            f"[BatchRetarget] temp_config reuse={reused_temp_config_count}/{len(tasks)} "
+            f"[BatchRetarget] temp_config reuse={reused_temp_config_count}/{task_count} "
             f"root={config_root}"
         )
 
     print(
-        f"[BatchRetarget] robot={robot_name} motions={len(motions)} queued={len(tasks)} "
+        f"[BatchRetarget] robot={robot_name} motions={len(motions)} queued={task_count} "
         f"workers={workers} retarget_cpu_threads={retarget_cpu_threads} "
         f"retarget_gpus={','.join(retarget_gpus) if retarget_gpus else 'cpu'} "
         f"decoupled_source_preprocess={decoupled_source_preprocess} folder={motion_folder}"
@@ -1319,8 +1328,7 @@ def main():
     if use_progress_bars:
         print("[BatchRetarget] progress_bars=true; normal worker logs are hidden until failure.")
 
-    active_workers = max(1, min(int(workers), max(1, len(tasks))))
-    persistent_retarget_workers = bool(batch_retarget.get("persistent_retarget_workers", False))
+    active_workers = max(1, min(int(workers), max(1, task_count)))
     if persistent_retarget_workers and (not decoupled_source_preprocess or args.dry_run):
         raise ValueError(
             "persistent_retarget_workers=true currently requires "
@@ -1355,7 +1363,7 @@ def main():
             initializer=initialize_persistent_retarget_worker,
             initargs=(retarget_cpu_threads,),
         )
-        task_iter = iter(tasks)
+        task_iter = lazy_task_iter
         pending_source = {}
         pending_retarget = {}
         idle_source_executors = list(range(len(source_executors)))
@@ -1444,7 +1452,7 @@ def main():
                         elif completed_count % 100 == 0:
                             elapsed = max(time.monotonic() - started_at, 1e-9)
                             print(
-                                f"[PersistentRetarget] completed={completed_count}/{len(tasks)} "
+                                f"[PersistentRetarget] completed={completed_count}/{task_count} "
                                 f"rate_per_min={completed_count * 60.0 / elapsed:.2f} "
                                 f"source_pending={len(pending_source)} "
                                 f"retarget_pending={len(pending_retarget)}",
@@ -1455,6 +1463,11 @@ def main():
             for executor in source_executors:
                 executor.shutdown(wait=True, cancel_futures=True)
             retarget_executor.shutdown(wait=True, cancel_futures=True)
+        if reuse_temp_configs:
+            print(
+                f"[BatchRetarget] temp_config reuse={reused_temp_config_count}/{task_count} "
+                f"root={config_root}"
+            )
     else:
         task_queue = Queue(maxsize=max(active_workers, 1))
         threads = [
