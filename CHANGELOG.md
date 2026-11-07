@@ -8,6 +8,7 @@
   - 新增可选的常驻 CPU 重定向进程池，避免每条动作重复启动 Python、导入 MuJoCo/SMPL-X 及项目模块。
   - 新增 GPU 源特征 feeder 与 CPU 常驻 worker 的统一有界调度，限制在途缓存数量，并在失败时保留错误尾部和源特征缓存。
   - 新增每 100 条动作的吞吐、源预处理队列和 CPU 队列统计；生产模式不输出逐帧进度条。
+  - 新增可选的既有临时配置复用，并支持按间隔汇总 `skip_existing` 日志，避免全量续跑时重复改写五十余万个 JSON 或输出数万行跳过记录。
 - `scripts/retarget_smpl_to_humanoid_surface_vector_batch.py`
   - 将源表面槽位、三角面法向和相对面旋转改为跨帧向量化计算，并使用有界帧块控制临时内存。
   - 新增有界 LRU 静态缓存，按模板、槽位文件、配置和机器人资产身份复用源模板、源表面绑定、MuJoCo 模型及机器人槽位绑定。
@@ -27,5 +28,6 @@
 ### 使用约束
 
 - 常驻模式通过批配置 `retarget.persistent_retarget_workers=true` 启用，且必须同时启用 `decoupled_source_preprocess`。
+- 只有在机器人、求解器和数据契约均未改变的续跑任务中才可启用 `batch.reuse_temp_configs=true`；新契约必须重新生成逐动作配置。
 - 临时配置、源特征缓存和输出目录必须显式放在数据盘；本次生产配置均使用 `/data1`。
 - 切换全量任务时继续使用原机器人配置的绝对路径，以保持既有输出中的 `robot_xml` 元数据和 `skip_existing` 兼容性。

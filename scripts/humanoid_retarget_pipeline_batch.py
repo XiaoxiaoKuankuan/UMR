@@ -960,6 +960,8 @@ def main():
     config_root.mkdir(parents=True, exist_ok=True)
 
     print_lock = threading.Lock()
+    skip_log_every = max(1, int(batch.get("skip_log_every", 1)))
+    skipped_existing = 0
     clip_entries: list[dict[str, Any]] = []
     template_configs: dict[str, dict[str, Any]] = dict(preloaded_template_configs)
     for idx, motion_file in enumerate(motions, start=1):
@@ -984,7 +986,12 @@ def main():
                 template_name,
             )
             if retarget_result_compatible(out_path, clip_config_for_skip, quiet=True):
-                print(f"[BatchRetarget][skip][{idx:04d}/{len(motions):04d}] {out_path}")
+                skipped_existing += 1
+                if skipped_existing <= 10 or skipped_existing % skip_log_every == 0:
+                    print(
+                        f"[BatchRetarget][skip][{idx:04d}/{len(motions):04d}] "
+                        f"count={skipped_existing} {out_path}"
+                    )
                 continue
             print(f"[BatchRetarget][rebuild][{idx:04d}/{len(motions):04d}] incompatible cached result: {out_path}")
         if template_config is None:
@@ -1114,7 +1121,12 @@ def main():
                     template_name,
                 )
                 if retarget_result_compatible(out_path, clip_config_for_skip, quiet=True):
-                    print(f"[BatchRetarget][skip][{idx:04d}/{len(motions):04d}] {out_path}")
+                    skipped_existing += 1
+                    if skipped_existing <= 10 or skipped_existing % skip_log_every == 0:
+                        print(
+                            f"[BatchRetarget][skip][{idx:04d}/{len(motions):04d}] "
+                            f"count={skipped_existing} {out_path}"
+                        )
                     continue
                 print(f"[BatchRetarget][rebuild][{idx:04d}/{len(motions):04d}] incompatible cached result: {out_path}")
             clip_entries.append(
@@ -1127,6 +1139,12 @@ def main():
                     "template_name": template_name,
                 }
             )
+
+    if skipped_existing:
+        print(
+            f"[BatchRetarget] skip_existing verified={skipped_existing} "
+            f"log_every={skip_log_every}"
+        )
 
     if args.correspondence_only:
         motion_templates = [
@@ -1183,6 +1201,10 @@ def main():
             atexit.register(source_cache_tmp.cleanup)
             source_cache_root = Path(source_cache_tmp.name)
 
+    reuse_temp_configs = bool(batch.get("reuse_temp_configs", False))
+    if reuse_temp_configs and configured_temp_config_root is None:
+        raise ValueError("reuse_temp_configs=true requires an explicit batch.temp_config_root")
+    reused_temp_config_count = 0
     tasks = []
     for entry in clip_entries:
         idx = int(entry["index"])
@@ -1201,8 +1223,11 @@ def main():
             temp_config_path,
             correspondence_smpl_name,
         )
-        temp_config_path.parent.mkdir(parents=True, exist_ok=True)
-        temp_config_path.write_text(json.dumps(clean_config(clip_config), indent=2, sort_keys=True))
+        if reuse_temp_configs and temp_config_path.exists():
+            reused_temp_config_count += 1
+        else:
+            temp_config_path.parent.mkdir(parents=True, exist_ok=True)
+            temp_config_path.write_text(json.dumps(clean_config(clip_config), indent=2, sort_keys=True))
         cmd = [
             PYTHON,
             str(SCRIPTS / "retarget_smpl_to_humanoid_surface_vector_batch.py"),
@@ -1264,6 +1289,12 @@ def main():
                 "compact_log": compact_log,
                 "tail_lines_on_error": tail_lines,
             }
+        )
+
+    if reuse_temp_configs:
+        print(
+            f"[BatchRetarget] temp_config reuse={reused_temp_config_count}/{len(tasks)} "
+            f"root={config_root}"
         )
 
     print(
