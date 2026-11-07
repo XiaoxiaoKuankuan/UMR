@@ -9,6 +9,7 @@ import json
 import os
 import sys
 import xml.etree.ElementTree as ET
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 
@@ -82,6 +83,11 @@ load_body_segment_module({})
 DEFAULT_DATA = ROOT / "sample_data/smpl_motion_sample.pkl"
 DEFAULT_SLOTS = ROOT / "output/correspondence_template_residual_ae_reference_tuned/correspondence_slots_final.npz"
 PROGRESS_PREFIX = "__HUMANOID_BATCH_PROGRESS__"
+_STATIC_CACHE_LIMIT = max(1, int(os.environ.get("UMR_STATIC_RETARGET_CACHE_MAX", "8")))
+_SOURCE_TEMPLATE_CACHE = OrderedDict()
+_SOURCE_BINDING_CACHE = OrderedDict()
+_ROBOT_MODEL_CACHE = OrderedDict()
+_ROBOT_BINDING_CACHE = OrderedDict()
 SMPL_TO_ROBOT_ROOT_MATRIX = np.asarray(
     [
         [0.0, 0.0, 1.0],
@@ -90,6 +96,76 @@ SMPL_TO_ROBOT_ROOT_MATRIX = np.asarray(
     ],
     dtype=np.float32,
 )
+
+
+def static_cache_get(cache, key):
+    """读取进程内 LRU 缓存；未命中时返回 ``None``。"""
+    if key is None or key not in cache:
+        return None
+    value = cache.pop(key)
+    cache[key] = value
+    return value
+
+
+def static_cache_put(cache, key, value):
+    """写入有界 LRU 缓存，避免多种体型或机器人长期运行导致内存无界增长。"""
+    if key is None:
+        return value
+    cache.pop(key, None)
+    cache[key] = value
+    while len(cache) > _STATIC_CACHE_LIMIT:
+        cache.popitem(last=False)
+    return value
+
+
+def file_identity(path):
+    """返回能感知文件替换的稳定标识，用于隔离不同模型和槽位资产。"""
+    resolved = Path(path).expanduser().resolve()
+    stat = resolved.stat()
+    return str(resolved), int(stat.st_size), int(stat.st_mtime_ns)
+
+
+def json_fingerprint(value):
+    """对配置片段生成稳定摘要，忽略临时配置文件本身的路径差异。"""
+    def convert(item):
+        if isinstance(item, dict):
+            return {str(key): convert(child) for key, child in sorted(item.items())}
+        if isinstance(item, (list, tuple)):
+            return [convert(child) for child in item]
+        if isinstance(item, np.ndarray):
+            return item.tolist()
+        if isinstance(item, np.generic):
+            return item.item()
+        if isinstance(item, Path):
+            return str(item)
+        return item
+
+    payload = json.dumps(convert(value), sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()
+
+
+def source_template_cache_key(sequence, template_cfg, smplx_model_dir, soma_usd_path):
+    """为可安全复用的源模板建立键；未知源格式保守地禁用复用。"""
+    source_type = str(common.source_model_type(sequence, template_cfg)).lower()
+    if source_type == "smplx":
+        betas = template_cfg.get("betas")
+        betas_key = None if betas is None else hashlib.sha1(
+            np.asarray(betas, dtype=np.float32).reshape(-1).tobytes()
+        ).hexdigest()
+        return (
+            source_type,
+            str(template_cfg.get("name")),
+            str(template_cfg.get("gender", "neutral")).lower(),
+            betas_key,
+            file_identity(Path(smplx_model_dir) / f"SMPLX_{str(template_cfg.get('gender', 'neutral')).upper()}.pkl"),
+        )
+    if source_type == "soma":
+        return (
+            source_type,
+            str(template_cfg.get("name")),
+            file_identity(soma_usd_path),
+        )
+    return None
 
 
 def batch_progress_enabled() -> bool:
@@ -1395,15 +1471,31 @@ def estimate_ground_z_stream(sequence, frame_ids, args, source_joint_names=None,
 
 
 def source_slots_and_normals_for_vertices(vertices_scaled, template_faces, source_binding):
+    """批量把源网格上的重心坐标槽位还原到世界坐标，并计算对应面法向。
+
+    旧实现逐帧调用 NumPy 小算子，在短动作数量很大时 Python 调度成本会超过实际
+    数学计算。这里按有限帧块一次索引三角面并广播重心系数；帧块上限可通过
+    ``UMR_SURFACE_VECTOR_BATCH_FRAMES`` 调整，避免长序列产生过大的临时张量。
+    """
     vertices_scaled = np.asarray(vertices_scaled, dtype=np.float32)
     out = np.empty((len(vertices_scaled), len(source_binding["face_ids"]), 3), dtype=np.float32)
     normals = np.empty_like(out, dtype=np.float32)
     bound_faces = np.asarray(template_faces, dtype=np.int32)[np.asarray(source_binding["face_ids"], dtype=np.int32)]
-    for frame_idx, vertices in enumerate(vertices_scaled):
-        out[frame_idx] = common.dynamic_surface_template_to_world(vertices, template_faces, source_binding)
-        triangles = vertices[bound_faces]
-        normals[frame_idx] = normalize_vectors(
-            np.cross(triangles[:, 1] - triangles[:, 0], triangles[:, 2] - triangles[:, 0])
+    bary = np.asarray(source_binding["bary"], dtype=np.float32)
+    frame_batch = max(1, int(os.environ.get("UMR_SURFACE_VECTOR_BATCH_FRAMES", "128")))
+    for start in range(0, len(vertices_scaled), frame_batch):
+        end = min(start + frame_batch, len(vertices_scaled))
+        triangles = vertices_scaled[start:end, bound_faces]
+        out[start:end] = (
+            bary[None, :, 0:1] * triangles[:, :, 0]
+            + bary[None, :, 1:2] * triangles[:, :, 1]
+            + bary[None, :, 2:3] * triangles[:, :, 2]
+        ).astype(np.float32)
+        normals[start:end] = normalize_vectors(
+            np.cross(
+                triangles[:, :, 1] - triangles[:, :, 0],
+                triangles[:, :, 2] - triangles[:, :, 0],
+            )
         ).astype(np.float32)
     return out, normals
 
@@ -1418,23 +1510,40 @@ def source_face_rotations_for_vertices(
     source_binding,
     slot_ids=None,
 ):
+    """批量计算源表面三角面相对模板面的旋转矩阵。
+
+    模板基只计算一次，动作帧按受控内存块展开；返回形状和旧逐帧实现完全一致。
+    """
     face_ids = np.asarray(source_binding["face_ids"], dtype=np.int32)
     if slot_ids is not None:
         face_ids = face_ids[np.asarray(slot_ids, dtype=np.int32)]
     bound_faces = np.asarray(template_faces, dtype=np.int32)[face_ids]
 
-    def frames(vertices):
-        triangles = np.asarray(vertices, dtype=np.float64)[bound_faces]
+    def frames_from_triangles(triangles):
+        triangles = np.asarray(triangles, dtype=np.float64)
         e1 = normalize_vectors(triangles[:, 1] - triangles[:, 0])
         normals = normalize_vectors(np.cross(triangles[:, 1] - triangles[:, 0], triangles[:, 2] - triangles[:, 0]))
         e2 = normalize_vectors(np.cross(normals, e1))
         return np.stack([e1, e2, normals], axis=-1)
 
-    template_basis = frames(template_vertices)
+    template_basis = frames_from_triangles(np.asarray(template_vertices, dtype=np.float64)[bound_faces])
     template_basis_t = np.swapaxes(template_basis, 1, 2)
     rotations = np.empty((len(vertices_scaled), len(face_ids), 3, 3), dtype=np.float32)
-    for frame_idx, vertices in enumerate(vertices_scaled):
-        rotations[frame_idx] = (frames(vertices) @ template_basis_t).astype(np.float32)
+    frame_batch = max(1, int(os.environ.get("UMR_SURFACE_VECTOR_BATCH_FRAMES", "128")))
+    vertices_scaled = np.asarray(vertices_scaled)
+    for start in range(0, len(vertices_scaled), frame_batch):
+        end = min(start + frame_batch, len(vertices_scaled))
+        triangles = np.asarray(vertices_scaled[start:end], dtype=np.float64)[:, bound_faces]
+        e1 = normalize_vectors(triangles[:, :, 1] - triangles[:, :, 0])
+        normals = normalize_vectors(
+            np.cross(
+                triangles[:, :, 1] - triangles[:, :, 0],
+                triangles[:, :, 2] - triangles[:, :, 0],
+            )
+        )
+        e2 = normalize_vectors(np.cross(normals, e1))
+        bases = np.stack([e1, e2, normals], axis=-1)
+        rotations[start:end] = (bases @ template_basis_t[None]).astype(np.float32)
     return rotations
 
 
@@ -1668,12 +1777,24 @@ def main(argv=None):
     gender = str(sequence.get("gender", "neutral")).lower()
     template_cfg = smpl_template_config(args.config_data, sequence, seq_key, gender)
     soma_usd_path = resolve_path(template_cfg.get("soma_usd_path"), args.config_data, "sample_data/soma/soma_base_skel_minimal.usd")
-    template_vertices, template_joints, faces, source_joint_names, source_model_type = common.source_template_vertices_joints_faces(
+    template_cache_key = source_template_cache_key(
         sequence,
         template_cfg,
         args.smplx_model_dir,
-        soma_usd_path=soma_usd_path,
+        soma_usd_path,
     )
+    template_payload = static_cache_get(_SOURCE_TEMPLATE_CACHE, template_cache_key)
+    if template_payload is None:
+        template_payload = common.source_template_vertices_joints_faces(
+            sequence,
+            template_cfg,
+            args.smplx_model_dir,
+            soma_usd_path=soma_usd_path,
+        )
+        static_cache_put(_SOURCE_TEMPLATE_CACHE, template_cache_key, template_payload)
+    else:
+        print(f"[HumanoidRetarget][StaticCache] source_template hit={template_cfg['name']}")
+    template_vertices, template_joints, faces, source_joint_names, source_model_type = template_payload
     human_height = (
         float(args.human_height)
         if float(args.human_height) > 0.0
@@ -1702,19 +1823,45 @@ def main(argv=None):
     )
     if len(smpl_slots) != len(robot_slots):
         raise ValueError(f"SMPL slots={len(smpl_slots)} and robot slots={len(robot_slots)} differ.")
-    _tpose_source_slots, _tpose_source_slot_normals, source_slot_part_ids, source_tpose_slot_normals, source_binding = bind_source_slots_with_normals(
-        smpl_slots,
-        template_vertices_centered,
-        faces,
-        template_vertices_centered[None, :, :],
-        common.bind_points_to_mesh,
-        common.dynamic_surface_template_to_world,
-        nearest_vertex_k=args.bind_nearest_vertex_k,
-        log_prefix="HumanoidRetarget",
-        source_model_type=source_model_type,
-        source_joint_names=source_joint_names,
-        source_template_joints=template_joints_centered,
+    source_binding_key = (
+        (
+            template_cache_key,
+            file_identity(args.slots),
+            str(args.slots_field),
+            str(smpl_slot_name),
+            int(args.bind_nearest_vertex_k),
+            str(args.body_segment_module),
+            str(args.body_segment_schema),
+            json_fingerprint(section(section(args.config_data, "solver"), "body_segment")),
+        )
+        if template_cache_key is not None
+        else None
     )
+    source_binding_payload = static_cache_get(_SOURCE_BINDING_CACHE, source_binding_key)
+    if source_binding_payload is None:
+        source_binding_payload = bind_source_slots_with_normals(
+            smpl_slots,
+            template_vertices_centered,
+            faces,
+            template_vertices_centered[None, :, :],
+            common.bind_points_to_mesh,
+            common.dynamic_surface_template_to_world,
+            nearest_vertex_k=args.bind_nearest_vertex_k,
+            log_prefix="HumanoidRetarget",
+            source_model_type=source_model_type,
+            source_joint_names=source_joint_names,
+            source_template_joints=template_joints_centered,
+        )
+        static_cache_put(_SOURCE_BINDING_CACHE, source_binding_key, source_binding_payload)
+    else:
+        print(f"[HumanoidRetarget][StaticCache] source_binding hit={template_cfg['name']}")
+    (
+        _tpose_source_slots,
+        _tpose_source_slot_normals,
+        source_slot_part_ids,
+        source_tpose_slot_normals,
+        source_binding,
+    ) = source_binding_payload
 
     segment_groups = body_segment_slot_groups(source_slot_part_ids)
     print(
@@ -1819,7 +1966,17 @@ def main(argv=None):
     args.out.parent.mkdir(parents=True, exist_ok=True)
     source_robot_xml = Path(args.robot_xml)
     robot_xml = prepare_robot_xml(args)
-    model = mujoco.MjModel.from_xml_path(str(robot_xml))
+    robot_model_key = (
+        file_identity(source_robot_xml),
+        json_fingerprint(robot_config(args.config_data)),
+        bool(args.force_no_floating_root),
+    )
+    model = static_cache_get(_ROBOT_MODEL_CACHE, robot_model_key)
+    if model is None:
+        model = mujoco.MjModel.from_xml_path(str(robot_xml))
+        static_cache_put(_ROBOT_MODEL_CACHE, robot_model_key, model)
+    else:
+        print(f"[HumanoidRetarget][StaticCache] robot_model hit={source_robot_xml}")
     data_mj = mujoco.MjData(model)
     robot_self_penetration_cache = common.build_robot_self_penetration_cache(model, args)
     ground_penetration_collision_cache = common.build_ground_penetration_collision_cache(model, args)
@@ -1839,15 +1996,30 @@ def main(argv=None):
         f"[HumanoidRetarget][StepLimit] dof_max_dq_box configured={len(configured_dof_max_dq_box)} "
         f"matched_same_name={len(configured_dof_max_dq_matches)}"
     )
-    robot_template = bind_robot_slots(
-        model,
-        args,
-        robot_slots,
-        nearest_vertex_k=args.bind_nearest_vertex_k,
-        project_to_surface=bool(args.project_robot_slots),
-        source_model_type=source_model_type,
-        template_cfg=template_cfg,
+    robot_binding_key = (
+        robot_model_key,
+        file_identity(args.slots),
+        str(args.slots_field),
+        str(robot_slot_name),
+        int(args.bind_nearest_vertex_k),
+        bool(args.project_robot_slots),
+        str(source_model_type),
+        json_fingerprint(template_cfg),
     )
+    robot_template = static_cache_get(_ROBOT_BINDING_CACHE, robot_binding_key)
+    if robot_template is None:
+        robot_template = bind_robot_slots(
+            model,
+            args,
+            robot_slots,
+            nearest_vertex_k=args.bind_nearest_vertex_k,
+            project_to_surface=bool(args.project_robot_slots),
+            source_model_type=source_model_type,
+            template_cfg=template_cfg,
+        )
+        static_cache_put(_ROBOT_BINDING_CACHE, robot_binding_key, robot_template)
+    else:
+        print(f"[HumanoidRetarget][StaticCache] robot_binding hit={robot_slot_name}")
     robot = robot_config(args.config_data)
     robot_sample_pose = robot_sample_pose_for_source(args.config_data, source_model_type, template_cfg)
     robot_sample_qpos = robot_sample_qpos_for_pose(args.config_data, robot_sample_pose)

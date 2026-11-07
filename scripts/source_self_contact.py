@@ -1,3 +1,13 @@
+"""源动作自接触映射的批量计算工具。
+
+本模块接收按时间排列的源人体表面采样点，先过滤相邻身体分段，再为每一帧生成
+全局阈值 Top-K 与身体分段对 Top-K 两类自接触约束。为了避免 MotionMillion 这类
+大规模数据转换在 Python 层逐帧重复发起八万余次点对距离计算，距离阶段按少量帧
+组成的内存块向量化；后续筛选、排序、权重与返回结构仍逐帧执行，从而保持既有
+数据格式、排序规则和数值语义。输入和输出均为 NumPy 数组/字典，不写文件；
+``distance_batch_frames`` 可控制速度与临时内存之间的权衡，默认值兼顾常见服务器。
+"""
+
 from __future__ import annotations
 
 import json
@@ -23,8 +33,9 @@ def compute_source_self_contact_map_groups(
     max_pairs=256,
     body_topk=None,
     log_prefix="Retarget",
+    distance_batch_frames=8,
 ):
-    """Build multiple self-contact maps while sharing pairwise distances."""
+    """构建多种自接触映射，并以跨帧向量化方式复用候选点对距离。"""
     modes = tuple(dict.fromkeys(str(mode) for mode in modes))
     unknown_modes = [mode for mode in modes if mode not in SELF_CONTACT_MAP_MODES]
     if unknown_modes:
@@ -91,59 +102,70 @@ def compute_source_self_contact_map_groups(
                 f"{', '.join(sorted(unknown_topk_names))}"
             )
 
-    for frame_points in source_slots:
-        points = frame_points[selected_slot_ids]
-        distances = np.linalg.norm(points[upper_i] - points[upper_j], axis=1).astype(np.float32)
+    # 只把最重的候选点对距离跨帧批处理；每帧的筛选与排序仍沿用旧逻辑，
+    # 这样不会改变相同距离下的顺序、身体分段配额或权重赋值规则。
+    distance_batch_frames = max(1, int(distance_batch_frames))
+    for chunk_start in range(0, len(source_slots), distance_batch_frames):
+        chunk_points = source_slots[
+            chunk_start : chunk_start + distance_batch_frames,
+            selected_slot_ids,
+        ]
+        chunk_distances = np.linalg.norm(
+            chunk_points[:, upper_i] - chunk_points[:, upper_j],
+            axis=2,
+        ).astype(np.float32)
 
-        if "threshold_global_topk" in modes:
-            active = np.flatnonzero(distances <= threshold)
-            if active.size > 0:
-                active = active[np.argsort(distances[active])]
-                if max_pairs > 0 and active.size > max_pairs:
-                    active = active[:max_pairs]
-            threshold_maps.append(
-                {
-                    "slot_pairs": pair_slot_ids[active].astype(np.int32),
-                    "distances": distances[active].astype(np.float32),
-                }
-            )
-            threshold_counts.append(int(active.size))
+        for distances in chunk_distances:
 
-        if "source_clearance_body_pair_topk" in modes:
-            active_chunks = []
-            for body_pair, group in body_pair_groups:
-                part_i, part_j = int(body_pair[0]), int(body_pair[1])
-                keep_per_group = max(
-                    int(body_topk_by_part_id.get(part_i, default_body_topk)),
-                    int(body_topk_by_part_id.get(part_j, default_body_topk)),
+            if "threshold_global_topk" in modes:
+                active = np.flatnonzero(distances <= threshold)
+                if active.size > 0:
+                    active = active[np.argsort(distances[active])]
+                    if max_pairs > 0 and active.size > max_pairs:
+                        active = active[:max_pairs]
+                threshold_maps.append(
+                    {
+                        "slot_pairs": pair_slot_ids[active].astype(np.int32),
+                        "distances": distances[active].astype(np.float32),
+                    }
                 )
-                if keep_per_group <= 0:
-                    continue
-                order = np.argsort(distances[group])
-                active_chunks.append(group[order[:keep_per_group]])
-            active = (
-                np.concatenate(active_chunks).astype(np.int32)
-                if active_chunks
-                else np.zeros(0, dtype=np.int32)
-            )
-            active_distances = distances[active].astype(np.float32)
-            weights = np.ones(len(active_distances), dtype=np.float32)
-            if len(active_distances) > 1:
-                rank_order = np.argsort(active_distances)
-                weights[rank_order] = np.linspace(
-                    1.0,
-                    0.1,
-                    len(active_distances),
-                    dtype=np.float32,
+                threshold_counts.append(int(active.size))
+
+            if "source_clearance_body_pair_topk" in modes:
+                active_chunks = []
+                for body_pair, group in body_pair_groups:
+                    part_i, part_j = int(body_pair[0]), int(body_pair[1])
+                    keep_per_group = max(
+                        int(body_topk_by_part_id.get(part_i, default_body_topk)),
+                        int(body_topk_by_part_id.get(part_j, default_body_topk)),
+                    )
+                    if keep_per_group <= 0:
+                        continue
+                    order = np.argsort(distances[group])
+                    active_chunks.append(group[order[:keep_per_group]])
+                active = (
+                    np.concatenate(active_chunks).astype(np.int32)
+                    if active_chunks
+                    else np.zeros(0, dtype=np.int32)
                 )
-            clearance_maps.append(
-                {
-                    "slot_pairs": pair_slot_ids[active].astype(np.int32),
-                    "distances": active_distances,
-                    "weights": weights,
-                }
-            )
-            clearance_counts.append(int(active.size))
+                active_distances = distances[active].astype(np.float32)
+                weights = np.ones(len(active_distances), dtype=np.float32)
+                if len(active_distances) > 1:
+                    rank_order = np.argsort(active_distances)
+                    weights[rank_order] = np.linspace(
+                        1.0,
+                        0.1,
+                        len(active_distances),
+                        dtype=np.float32,
+                    )
+                clearance_maps.append(
+                    {
+                        "slot_pairs": pair_slot_ids[active].astype(np.int32),
+                        "distances": active_distances,
+                        "weights": weights,
+                    }
+                )
+                clearance_counts.append(int(active.size))
 
     result = {}
     if "threshold_global_topk" in modes:

@@ -1,9 +1,20 @@
 #!/usr/bin/env python3
-"""CPU-parallel retargeting for SMPL-X/SOMA files or flat SMPL-X sequence directories."""
+"""面向大规模 SMPL-X/SOMA 数据集的 CPU/GPU 解耦批量重定向入口。
+
+脚本负责发现动作、复用对应关系、由 GPU 常驻进程提取源特征，再把缓存交给 CPU
+重定向 worker。默认兼容原先“每条动作启动一个子进程”的方式；启用
+``persistent_retarget_workers`` 后，每个 CPU worker 只初始化一次 Python、MuJoCo 与
+项目模块，随后连续处理多条动作，显著减少短动作上的进程启动和模块加载开销。
+输入为机器人配置、批配置和动作目录，输出为逐动作 NPZ 与批量摘要；源特征缓存、
+临时配置和输出目录均应在批配置中显式指向数据盘。脚本不改变求解器数学语义，
+并在单条失败时保留源缓存和错误尾部，便于复核与安全续跑。
+"""
 from __future__ import annotations
 
 import argparse
 import atexit
+import contextlib
+import io
 import json
 import multiprocessing
 import os
@@ -12,6 +23,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import zipfile
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, ThreadPoolExecutor, as_completed, wait
 from pathlib import Path
@@ -49,6 +61,7 @@ PYTHON = sys.executable
 DEFAULT_BATCH_CONFIG = ROOT / "humanoid_retarget_defaults_batch.json"
 PROGRESS_PREFIX = "__HUMANOID_BATCH_PROGRESS__"
 _SOURCE_PREPROCESS_MODULE = None
+_PERSISTENT_RETARGET_MODULE = None
 
 
 def parse_args():
@@ -565,6 +578,62 @@ def run_source_preprocess_task(argv: list[str], cache_path: str, motion: str) ->
         raise RuntimeError("Source feature feeder was not initialized.")
     _SOURCE_PREPROCESS_MODULE.main(argv)
     return {"cache": str(cache_path), "motion": str(motion)}
+
+
+def initialize_persistent_retarget_worker(cpu_threads: int = 1) -> None:
+    """初始化常驻 CPU worker，并只导入一次重定向模块及其重依赖。"""
+    global _PERSISTENT_RETARGET_MODULE
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""
+    for key in (
+        "OMP_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+        "VECLIB_MAXIMUM_THREADS",
+        "BLIS_NUM_THREADS",
+        "NUMBA_NUM_THREADS",
+    ):
+        os.environ[key] = str(max(1, int(cpu_threads)))
+    os.environ.pop("HUMANOID_BATCH_PROGRESS", None)
+    import retarget_smpl_to_humanoid_surface_vector_batch as retarget_module
+
+    _PERSISTENT_RETARGET_MODULE = retarget_module
+
+
+def run_persistent_retarget_task(task: dict[str, Any]) -> dict[str, Any]:
+    """在已初始化的 worker 内直接调用重定向 ``main``，避免逐动作重启解释器。"""
+    if _PERSISTENT_RETARGET_MODULE is None:
+        raise RuntimeError("Persistent retarget worker was not initialized.")
+    motion_file = Path(task["motion_file"])
+    out_path = Path(task["out_path"])
+    source_feature_cache = task.get("source_feature_cache")
+    tail_lines = max(1, int(task.get("tail_lines_on_error", 80)))
+    captured = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(captured), contextlib.redirect_stderr(captured):
+            _PERSISTENT_RETARGET_MODULE.main(list(task["cmd"])[2:])
+        if not out_path.exists():
+            raise FileNotFoundError(f"Retarget worker returned without output: {out_path}")
+    except BaseException as exc:
+        tail = captured.getvalue().splitlines()[-tail_lines:]
+        return {
+            "status": "failed",
+            "code": -3,
+            "stage": "persistent_cpu_retarget",
+            "motion": str(motion_file),
+            "out": str(out_path),
+            "error": repr(exc),
+            "tail": tail,
+            "worker_pid": os.getpid(),
+        }
+    if source_feature_cache:
+        Path(source_feature_cache).unlink(missing_ok=True)
+    return {
+        "status": "ok",
+        "motion": str(motion_file),
+        "out": str(out_path),
+        "worker_pid": os.getpid(),
+    }
 
 
 def parse_progress_line(line: str) -> tuple[int, int] | None:
@@ -1220,18 +1289,155 @@ def main():
         print("[BatchRetarget] progress_bars=true; normal worker logs are hidden until failure.")
 
     active_workers = max(1, min(int(workers), max(1, len(tasks))))
-    task_queue = Queue(maxsize=max(active_workers, 1))
-    threads = [
-        threading.Thread(
-            target=worker_loop,
-            args=(worker_id, task_queue, results, results_lock, print_lock, use_progress_bars),
-            daemon=False,
+    persistent_retarget_workers = bool(batch_retarget.get("persistent_retarget_workers", False))
+    if persistent_retarget_workers and (not decoupled_source_preprocess or args.dry_run):
+        raise ValueError(
+            "persistent_retarget_workers=true currently requires "
+            "decoupled_source_preprocess=true and a non-dry-run launch"
         )
-        for worker_id in range(active_workers)
-    ]
-    for thread in threads:
-        thread.start()
-    if decoupled_source_preprocess and not args.dry_run:
+
+    if persistent_retarget_workers:
+        if use_progress_bars:
+            print("[BatchRetarget] persistent workers force progress_bars=false to keep worker IPC bounded.")
+            use_progress_bars = False
+        max_inflight = max(
+            len(source_feeder_devices),
+            int(batch_retarget.get("persistent_max_inflight", active_workers * 2)),
+        )
+        print(
+            f"[BatchRetarget] persistent_retarget_workers=true cpu_workers={active_workers} "
+            f"max_inflight={max_inflight}"
+        )
+        mp_context = multiprocessing.get_context("spawn")
+        source_executors = [
+            ProcessPoolExecutor(
+                max_workers=1,
+                mp_context=mp_context,
+                initializer=initialize_source_preprocess_worker,
+                initargs=(gpu_id, 1),
+            )
+            for gpu_id in source_feeder_devices
+        ]
+        retarget_executor = ProcessPoolExecutor(
+            max_workers=active_workers,
+            mp_context=mp_context,
+            initializer=initialize_persistent_retarget_worker,
+            initargs=(retarget_cpu_threads,),
+        )
+        task_iter = iter(tasks)
+        pending_source = {}
+        pending_retarget = {}
+        idle_source_executors = list(range(len(source_executors)))
+        task_input_exhausted = False
+        completed_count = 0
+        started_at = time.monotonic()
+
+        def fill_source_executors():
+            """在总在途任务上限内填满空闲 GPU feeder。"""
+            nonlocal task_input_exhausted
+            while (
+                idle_source_executors
+                and not task_input_exhausted
+                and len(pending_source) + len(pending_retarget) < max_inflight
+            ):
+                try:
+                    task = next(task_iter)
+                except StopIteration:
+                    task_input_exhausted = True
+                    break
+                executor_index = idle_source_executors.pop()
+                future = source_executors[executor_index].submit(
+                    run_source_preprocess_task,
+                    list(task["preprocess_argv"]),
+                    str(task["source_feature_cache"]),
+                    str(task["motion_file"]),
+                )
+                pending_source[future] = (executor_index, task)
+
+        fill_source_executors()
+        try:
+            while pending_source or pending_retarget:
+                completed, _not_done = wait(
+                    tuple(pending_source) + tuple(pending_retarget),
+                    return_when=FIRST_COMPLETED,
+                )
+                for future in completed:
+                    if future in pending_source:
+                        executor_index, task = pending_source.pop(future)
+                        idle_source_executors.append(executor_index)
+                        try:
+                            future.result()
+                        except Exception as exc:
+                            results.append(
+                                {
+                                    "status": "failed",
+                                    "code": -2,
+                                    "stage": "source_feature_preprocess",
+                                    "motion": str(task["motion_file"]),
+                                    "out": str(task["out_path"]),
+                                    "error": repr(exc),
+                                }
+                            )
+                            print(
+                                f"[SourceFeatureFeeder][FAILED] "
+                                f"gpu={source_feeder_devices[executor_index]} "
+                                f"motion={task['motion_file']} error={exc!r}",
+                                flush=True,
+                            )
+                        else:
+                            retarget_future = retarget_executor.submit(run_persistent_retarget_task, task)
+                            pending_retarget[retarget_future] = task
+                    else:
+                        task = pending_retarget.pop(future)
+                        try:
+                            result = future.result()
+                        except Exception as exc:
+                            result = {
+                                "status": "failed",
+                                "code": -4,
+                                "stage": "persistent_cpu_retarget_executor",
+                                "motion": str(task["motion_file"]),
+                                "out": str(task["out_path"]),
+                                "error": repr(exc),
+                            }
+                        results.append(result)
+                        completed_count += 1
+                        if result["status"] == "failed":
+                            print(
+                                f"[PersistentRetarget][FAILED] motion={result['motion']} "
+                                f"error={result.get('error', 'unknown')}",
+                                flush=True,
+                            )
+                            for line in result.get("tail", []):
+                                print(f"[PersistentRetarget][tail] {line}", flush=True)
+                        elif completed_count % 100 == 0:
+                            elapsed = max(time.monotonic() - started_at, 1e-9)
+                            print(
+                                f"[PersistentRetarget] completed={completed_count}/{len(tasks)} "
+                                f"rate_per_min={completed_count * 60.0 / elapsed:.2f} "
+                                f"source_pending={len(pending_source)} "
+                                f"retarget_pending={len(pending_retarget)}",
+                                flush=True,
+                            )
+                fill_source_executors()
+        finally:
+            for executor in source_executors:
+                executor.shutdown(wait=True, cancel_futures=True)
+            retarget_executor.shutdown(wait=True, cancel_futures=True)
+    else:
+        task_queue = Queue(maxsize=max(active_workers, 1))
+        threads = [
+            threading.Thread(
+                target=worker_loop,
+                args=(worker_id, task_queue, results, results_lock, print_lock, use_progress_bars),
+                daemon=False,
+            )
+            for worker_id in range(active_workers)
+        ]
+        for thread in threads:
+            thread.start()
+
+    if decoupled_source_preprocess and not args.dry_run and not persistent_retarget_workers:
         print(
             f"[BatchRetarget] source_feature_feeders={len(source_feeder_devices)} "
             f"workers_per_gpu={source_feature_workers_per_gpu} "
@@ -1295,14 +1501,15 @@ def main():
         finally:
             for executor in executors:
                 executor.shutdown(wait=True, cancel_futures=True)
-    else:
+    elif not persistent_retarget_workers:
         for task in tasks:
             task_queue.put(task)
-    for _ in threads:
-        task_queue.put(None)
-    task_queue.join()
-    for thread in threads:
-        thread.join()
+    if not persistent_retarget_workers:
+        for _ in threads:
+            task_queue.put(None)
+        task_queue.join()
+        for thread in threads:
+            thread.join()
 
     summary = {
         "robot": robot_name,
@@ -1314,6 +1521,7 @@ def main():
         "decoupled_source_preprocess": decoupled_source_preprocess,
         "source_feature_feeders": len(source_feeder_devices) if decoupled_source_preprocess else 0,
         "source_feature_workers_per_gpu": source_feature_workers_per_gpu,
+        "persistent_retarget_workers": persistent_retarget_workers,
         "stream_chunk_frames": int(batch_retarget.get("stream_chunk_frames", 0)),
         "results": sorted(results, key=lambda item: item["motion"]),
     }
