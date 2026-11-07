@@ -943,6 +943,32 @@ def main():
         if value is not None:
             motion_overrides[key] = value
 
+    fixed_template_config = None
+    fixed_template_name = None
+    fixed_template_example = batch.get("fixed_template_example_motion")
+    if fixed_template_example:
+        fixed_template_path = batch_path(
+            fixed_template_example,
+            fixed_template_example,
+            args.batch_config,
+        )
+        if not fixed_template_path.exists():
+            raise FileNotFoundError(f"Fixed template example motion not found: {fixed_template_path}")
+        fixed_template_config = template_config_for_motion(
+            base_config,
+            fixed_template_path,
+            motion_overrides,
+        )
+        fixed_template_name = template_name_for_motion(
+            base_config,
+            fixed_template_path,
+            motion_overrides,
+        )
+        print(
+            f"[BatchRetarget] fixed_template name={fixed_template_name} "
+            f"example={fixed_template_path}"
+        )
+
     motion_inventory_configs: dict[str, dict[str, Any]] = {}
     for expected_name, item in motion_inventory_templates.items():
         example_motion = Path(item["example_motion"]).expanduser().resolve()
@@ -968,10 +994,12 @@ def main():
         stem = sanitize_stem(motion_file, motion_folder)
         out_path = result_root / f"{stem}_{robot_name}.npz"
         temp_config_path = config_root / f"{stem}_{robot_name}.json"
-        template_name = motion_inventory_template_by_motion.get(str(motion_file))
-        template_config = (
-            motion_inventory_configs.get(template_name) if template_name is not None else None
-        )
+        template_name = fixed_template_name or motion_inventory_template_by_motion.get(str(motion_file))
+        template_config = fixed_template_config
+        if template_config is None:
+            template_config = (
+                motion_inventory_configs.get(template_name) if template_name is not None else None
+            )
         if skip_existing and out_path.exists():
             if template_config is None:
                 template_config = template_config_for_motion(base_config, motion_file, motion_overrides)
@@ -997,7 +1025,7 @@ def main():
         if template_config is None:
             template_config = template_config_for_motion(base_config, motion_file, motion_overrides)
         if template_name is None:
-            template_name = template_name_for_motion(base_config, motion_file, motion_overrides)
+            template_name = fixed_template_name or template_name_for_motion(base_config, motion_file, motion_overrides)
         template_configs.setdefault(template_name, template_config)
         clip_entries.append(
             {
@@ -1105,7 +1133,11 @@ def main():
             stem = sanitize_stem(motion_file, motion_folder)
             out_path = result_root / f"{stem}_{robot_name}.npz"
             temp_config_path = config_root / f"{stem}_{robot_name}.json"
-            template_name = template_name_for_motion(base_config, motion_file, motion_overrides)
+            template_name = fixed_template_name or template_name_for_motion(
+                base_config,
+                motion_file,
+                motion_overrides,
+            )
             if template_name not in slots_by_template:
                 raise KeyError(
                     f"No correspondence was prepared for {template_name}; motion={motion_file}. "
