@@ -1,0 +1,88 @@
+{
+  "robot": {
+    "name": "bumi_v2",
+    "xml": "../assets/bumi_v2_supermimic_caa309ddd569/mjcf/bumi2.xml",
+    "point_cloud_center": "body:waist_yaw_link",
+    "height": 1.01364164904,
+    "visual_geom_policy": "auto",
+    "to_smpl_frame": true,
+    "sample_pose": "tpose",
+    "tpose_qpos": {
+      "l_arm_roll_joint": 1.57079632679,
+      "r_arm_roll_joint": -1.57079632679,
+      "l_elbow_pitch_joint": 0.0,
+      "r_elbow_pitch_joint": 0.0
+    },
+    "xml_policy": {
+      "add_freejoint_root": false
+    }
+  },
+  "correspondence": {
+    "slots": "/data0/user/liwei/UMR-throughput-opt-20261107/runtime/correspondence/output/correspondence_bumi_v2/correspondence_slots_final.npz",
+    "dataset": {
+      "out": "/data0/user/liwei/UMR-throughput-opt-20261107/runtime/correspondence/data/correspondence_bumi_v2.npz",
+      "smpl_models": [
+        {
+          "type": "smplx",
+          "dir": "smpl",
+          "genders": [
+            "neutral",
+            "male",
+            "female"
+          ]
+        }
+      ]
+    },
+    "train": {
+      "device": "cuda",
+      "out_dir": "/data0/user/liwei/UMR-throughput-opt-20261107/runtime/correspondence/output/correspondence_bumi_v2"
+    }
+  },
+  "solver": {
+    "fit_amplitude_to_limits": true,
+    "fit_amplitude_expand_rad": 0.8,
+    "fit_amplitude_min_scale": 0.5,
+    "fit_amplitude_margin": 0.02,
+    "fit_amplitude_near_limit_headroom": 0.4,
+    "fit_amplitude_exclude_substrings": [
+      "ankle"
+    ],
+    "fit_amplitude_scale_root_xy": false,
+    "fit_amplitude_scale_root_z": true,
+    "ground_contact_map_cost": 25.0,
+    "ground_contact_anchor_cost": 12.0,
+    "ground_contact_map_threshold": 0.08,
+    "ground_penetration_threshold": 0.03,
+    "smooth_cost": 1.5,
+    "temporal_smooth_cost": 0.8,
+    "pose_init_iters": 20,
+    "body_segment": {
+      "cost_config": {
+        "leftHand": {"sample_slots": 15, "point_cost": 3.0, "normal_cost": 0.2},
+        "rightHand": {"sample_slots": 15, "point_cost": 3.0, "normal_cost": 0.2},
+        "leftForeArm": {"sample_slots": 8, "point_cost": 6.0, "normal_cost": 2.0},
+        "rightForeArm": {"sample_slots": 8, "point_cost": 6.0, "normal_cost": 2.0},
+        "leftArm": {"sample_slots": 15, "point_cost": 6.0, "normal_cost": 3.0},
+        "rightArm": {"sample_slots": 15, "point_cost": 6.0, "normal_cost": 3.0},
+        "leftFoot": {"sample_slots": 30, "point_cost": 20.0, "normal_cost": 3.0},
+        "rightFoot": {"sample_slots": 30, "point_cost": 20.0, "normal_cost": 3.0},
+        "leftLeg": {"sample_slots": 20, "point_cost": 14.0, "normal_cost": 6.0},
+        "rightLeg": {"sample_slots": 20, "point_cost": 14.0, "normal_cost": 6.0},
+        "leftUpLeg": {"sample_slots": 25, "point_cost": 14.0, "normal_cost": 6.0},
+        "rightUpLeg": {"sample_slots": 25, "point_cost": 14.0, "normal_cost": 6.0}
+      }
+    }
+  },
+  "retarget": {
+    "smplx_device": "cuda",
+    "smplx_batch_size": 256,
+    "smplx_batch_size_max": 256
+  },
+  "smpl_template": {
+    "source": "motion",
+    "type": "smplx",
+    "use_betas": false,
+    "use_gender": true,
+    "name": "smplx_neutral"
+  }
+}

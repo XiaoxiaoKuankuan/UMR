@@ -1,5 +1,19 @@
 # UMR 代码变更日志
 
+## 2026-11-07：Server-1 音乐舞蹈数据集 BUMI V2 新模型重定向
+
+### 修改内容
+
+- 新增 `robot_configs/humanoid_retarget_bumi_v2_music7286_latest.json`：使用 SuperMimic 最新 BUMI V2 `bumi2.xml`，关节限位完全由该 XML 提供；保留音乐舞蹈数据已验证的振幅限位、接地与时序平滑配置，并复用同一 XML 已验证的 correspondence 数值结果。为保持下游数据契约，专用副本仅把机器人槽位标识由 `bumi2` 改为 `bumi_v2`，数值数组不变。
+- 新增 `configs/production/server1_music7286_bumi_v2_gpu67.json`：仅使用物理 GPU 6、7，启用 GPU 源特征预处理与 CPU QP 常驻进程解耦、固定中性 SMPL-X 模板、16 个常驻源特征进程、144 个单线程 CPU worker、有界在途队列与可恢复续跑。
+- 新增 `scripts/launch_server1_music7286_bumi_v2_gpu67.sh`：将临时配置、特征缓存、日志和通用临时目录全部固定在 `/data0`，避免写入根分区；关闭进度条并记录任务状态。
+
+### 数据契约与约束
+
+- 输入固定为 `/home/user/music7286_umr/motions_keep` 中筛选后的 6,915 条音乐舞蹈 SMPL-X 动作；数据审计确认 6,915/6,915 均为 `gender=neutral`，且配置禁用个体 betas，因此允许复用固定人体模板。
+- 输出保持 `robot_name=bumi_v2`、30 Hz、28 维 qpos，并直接写入现有 `raw_umr` 数据位置；启动前必须清除旧 XML 生成的 `raw_umr`、`npz50` 和打包库，不得复用旧关节限位结果。
+- 该任务只生成离线运动学重定向结果，不代表物理闭环、强化学习训练或实机安全验证。
+
 ## 2026-11-07：大规模动作重定向吞吐优化
 
 ### 修改内容
